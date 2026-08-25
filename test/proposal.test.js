@@ -426,11 +426,133 @@ test("applying decisions writes accepted edits, skips rejected ones, and remembe
   assert.ok(written.includes("include its URL."), "the rejected rewrite is not applied");
   assert.equal(results.accepted, 1);
   assert.equal(results.rejected, 1);
+  assert.equal(results.rejectionsRecorded, true);
   assert.equal(results.failed.length, 0);
   assert.ok(results.written[0].budget.delta < 0);
 
   const remembered = state.readRejections();
   assert.equal(Object.keys(remembered.entries).length, 1);
+});
+
+test("apply refuses an accepted subset that exceeds the memory cap before writing any file", () => {
+  const skill = "---\nname: db\ndescription: old trigger\n---\n\nbody\n";
+  const cap = estimateTokens(MEMORY_TEXT);
+  const { proposal, violations, repo, state } = gate({
+    files: { ".agents/skills/db/SKILL.md": skill },
+    edit: (root) => {
+      writeIn(root, "AGENTS.md", (text) =>
+        text
+          .replace("- Use Node 18 via nvm before running any script.\n", "")
+          .replace("include its URL.", "include its full https:// URL."),
+      );
+      writeIn(root, ".agents/skills/db/SKILL.md", (text) =>
+        text.replace("old trigger", "Load before touching the database."),
+      );
+    },
+    annotation: {
+      edits: [
+        claim(["H2"], { kind: "remove", title: "drop node pin" }),
+        claim(["H1"], { title: "expand URL rule" }),
+        claim(["H3"], { title: "fix skill trigger" }),
+      ],
+    },
+    config: config({ budgetTokens: cap }),
+  });
+  assert.deepEqual(violations, [], "the complete proposal is valid because the removal pays for the addition");
+
+  const results = applyDecisions({
+    proposal,
+    decisions: { e1: "rejected", e2: "accepted", e3: "accepted" },
+    repo,
+    state,
+    config: { budgetTokens: cap },
+  });
+
+  assert.match(results.failed[0].error, /accepted edits leave AGENTS\.md .* over the .* budget/);
+  assert.equal(results.rejectionsRecorded, false);
+  assert.deepEqual(results.written, []);
+  assert.deepEqual(results.skills, []);
+  assert.equal(fs.readFileSync(path.join(repo.root, "AGENTS.md"), "utf8"), MEMORY_TEXT);
+  assert.equal(fs.readFileSync(path.join(repo.root, ".agents/skills/db/SKILL.md"), "utf8"), skill);
+  assert.equal(Object.keys(state.readRejections().entries).length, 0, "the reviewer can retry with a valid subset");
+});
+
+test("apply refuses a non-shrinking accepted subset when memory already exceeds the cap", () => {
+  const cap = estimateTokens(MEMORY_TEXT) - 1;
+  const { proposal, violations, repo, state } = gate({
+    edit: memoryEdit((text) =>
+      text
+        .replace("- Use Node 18 via nvm before running any script.\n", "")
+        .replace("include its URL.", "include its full https:// URL."),
+    ),
+    annotation: {
+      edits: [claim(["H2"], { kind: "remove", title: "drop node pin" }), claim(["H1"], { title: "expand URL rule" })],
+    },
+    config: config({ budgetTokens: cap }),
+  });
+  assert.deepEqual(violations, [], "the complete proposal is a valid shrink step");
+
+  const results = applyDecisions({
+    proposal,
+    decisions: { e1: "rejected", e2: "accepted" },
+    repo,
+    state,
+    config: { budgetTokens: cap },
+  });
+
+  assert.match(results.failed[0].error, /accepted edits must shrink it, but they change it by \+/);
+  assert.equal(results.rejectionsRecorded, false);
+  assert.deepEqual(results.written, []);
+  assert.equal(fs.readFileSync(path.join(repo.root, "AGENTS.md"), "utf8"), MEMORY_TEXT);
+  assert.equal(Object.keys(state.readRejections().entries).length, 0, "the reviewer can retry with a valid subset");
+});
+
+test("rejecting every edit remains valid when memory already exceeds the cap", () => {
+  const cap = estimateTokens(MEMORY_TEXT) - 1;
+  const { proposal, violations, repo, state } = gate({
+    edit: memoryEdit((text) => text.replace("- Use Node 18 via nvm before running any script.\n", "")),
+    annotation: { edits: [claim(["H1"], { kind: "remove", title: "drop node pin" })] },
+    config: config({ budgetTokens: cap }),
+  });
+  assert.deepEqual(violations, []);
+
+  const results = applyDecisions({
+    proposal,
+    decisions: { e1: "rejected" },
+    repo,
+    state,
+    config: { budgetTokens: cap },
+  });
+
+  assert.deepEqual(results.failed, []);
+  assert.deepEqual(results.written, []);
+  assert.equal(results.rejectionsRecorded, true);
+  assert.equal(Object.keys(state.readRejections().entries).length, 1);
+});
+
+test("apply preflight skips inapplicable accepted edits and still writes the rest", () => {
+  const { proposal, repo, state } = gate({
+    edit: memoryEdit((t) => t.replace("- Use Node 18 via nvm before running any script.\n", "")),
+    annotation: { edits: [claim(["H1"], { kind: "remove", title: "drop node pin" })] },
+  });
+  const stale = structuredClone(proposal.edits[0]);
+  stale.id = "e-stale";
+  stale.hunks[0].find = "text that is not in the file at all";
+  stale.hunks[0].replace = "x";
+  proposal.edits.push(stale);
+
+  const results = applyDecisions({
+    proposal,
+    decisions: { e1: "accepted", "e-stale": "accepted" },
+    repo,
+    state,
+    config: { budgetTokens: 5000 },
+  });
+
+  assert.equal(results.written.length, 1);
+  assert.equal(results.failed.length, 1);
+  assert.equal(results.failed[0].edit, "e-stale");
+  assert.ok(!fs.readFileSync(path.join(repo.root, "AGENTS.md"), "utf8").includes("Node 18"));
 });
 
 test("an accepted extract writes the skill the agent drafted, in the canonical layout", () => {

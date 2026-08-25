@@ -1,17 +1,54 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import { applyEdit } from "../proposal.js";
-import { budgetStatus } from "../tokens.js";
+import { applyEdit, projectWithDecisions } from "../proposal.js";
+import { budgetGateKind, budgetStatus } from "../tokens.js";
 import { recordRejection } from "../state.js";
 import { writeSkill } from "../skills.js";
+
+function acceptedSubsetBudgetFailure({ proposal, accepted, repo, capTokens }) {
+  if (!accepted.length) return null;
+
+  const relative = proposal.memoryFile.path;
+  const absolute = path.join(repo.root, relative);
+  if (!fs.existsSync(absolute)) return null;
+
+  const before = fs.readFileSync(absolute, "utf8");
+  const { budget } = projectWithDecisions(
+    before,
+    accepted,
+    accepted.map((edit) => edit.id),
+    capTokens,
+  );
+  const gate = budgetGateKind(budget);
+  if (gate === "cap") {
+    return {
+      file: relative,
+      error:
+        `accepted edits leave ${relative} at ${budget.projected} tokens, ${budget.over} over the ` +
+        `${capTokens}-token budget; choose a compatible set of edits`,
+    };
+  }
+  if (gate === "shrink") {
+    return {
+      file: relative,
+      error:
+        `${relative} is already ${budget.current - capTokens} tokens over the ${capTokens}-token budget, ` +
+        `so accepted edits must shrink it, but they change it by ${budget.delta >= 0 ? "+" : ""}${budget.delta} ` +
+        "tokens; choose a compatible set of edits",
+    };
+  }
+  return null;
+}
 
 /**
  * The only place in backpass that writes to the repo.
  *
  * Everything upstream is read-only analysis; a run only changes the weights here, after
- * a human accepted specific edits. Writes are grouped per file so a memory file is
- * rewritten once, atomically, rather than edit by edit.
+ * a human accepted specific edits. The accepted subset is rechecked with the same
+ * cap/shrink budget gate as the full proposal (`budgetGateKind`); a failing subset
+ * returns with no writes and no rejection ledger. Writes are grouped per file so a
+ * memory file is rewritten once, atomically, rather than edit by edit.
  */
 export function applyDecisions({ proposal, decisions, repo, state, config, dryRun = false }) {
   const accepted = proposal.edits.filter((e) => decisions[e.id] === "accepted");
@@ -25,7 +62,19 @@ export function applyDecisions({ proposal, decisions, repo, state, config, dryRu
     warnings: [],
     accepted: accepted.length,
     rejected: rejected.length,
+    rejectionsRecorded: false,
   };
+
+  const budgetFailure = acceptedSubsetBudgetFailure({
+    proposal,
+    accepted,
+    repo,
+    capTokens: config.budgetTokens,
+  });
+  if (budgetFailure) {
+    results.failed.push(budgetFailure);
+    return results;
+  }
 
   for (const edit of accepted) {
     if (!byFile.has(edit.file)) byFile.set(edit.file, []);
@@ -76,6 +125,7 @@ export function applyDecisions({ proposal, decisions, repo, state, config, dryRu
     const rejections = state.readRejections();
     for (const edit of rejected) recordRejection(edit, rejections);
     state.writeRejections(rejections);
+    results.rejectionsRecorded = true;
   }
 
   return results;

@@ -1,9 +1,10 @@
 import { renderHunkLines } from "./diff.js";
-import { budgetStatus, estimateTokens } from "./tokens.js";
+import { budgetGateKind, budgetStatus, estimateTokens } from "./tokens.js";
 
 /**
  * The proposal model: what a synthesis pass is allowed to produce, and the mechanical
- * gates it must clear before a human ever sees it (design sections 3, 6, 7).
+ * gates it must clear before a human ever sees it (design sections 3, 6, 7). The
+ * budget gate (`budgetGateKind`) runs again on the accepted subset at apply.
  *
  * The synthesis agent edits a staging copy of the memory file natively
  * (`src/workspace.js`); backpass measures the result as anchored hunks (`src/diff.js`)
@@ -355,12 +356,13 @@ export function buildProposal(rawResult, context) {
   budget.mode = memoryFile.tokens > config.budgetTokens ? "shrink" : "cap";
   budget.startedOverBudget = budget.mode === "shrink";
 
-  if (budget.mode === "cap" && !budget.withinBudget) {
+  const gate = budgetGateKind(budget);
+  if (gate === "cap") {
     violations.push(
       `applying every proposed edit leaves ${memoryFile.path} at ${budget.projected} tokens, ` +
         `${budget.over} over the ${config.budgetTokens}-token budget`,
     );
-  } else if (budget.mode === "shrink" && budget.delta >= 0) {
+  } else if (gate === "shrink") {
     violations.push(
       `${memoryFile.path} is already ${budget.current - config.budgetTokens} tokens over the ` +
         `${config.budgetTokens}-token budget, so this run must shrink it, but the proposed edits ` +

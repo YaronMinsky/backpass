@@ -10,7 +10,8 @@ import { budgetBar, formatTokens } from "../tokens.js";
  *
  * By default it serves the shipped static template through lavish-axi and waits for one
  * structured decision vector; `--no-ui` keeps the same ACCEPT/REJECT decision in the
- * terminal.
+ * terminal. `applyDecisions` revalidates the accepted subset against the budget before
+ * writing; a failing set records no rejections.
  */
 export async function cmdApply(ctx) {
   const { config, repo } = ctx;
@@ -97,7 +98,7 @@ export async function cmdApply(ctx) {
     out(`  ${color.red("failed")} ${failure.file}${failure.edit ? ` (${failure.edit})` : ""}: ${failure.error}`);
   }
 
-  if (results.rejected) {
+  if (results.rejectionsRecorded) {
     out(color.dim("  rejections recorded - they will not be re-proposed without new evidence"));
   }
   if (!results.written.length && !results.skills.length) out("  nothing written");
