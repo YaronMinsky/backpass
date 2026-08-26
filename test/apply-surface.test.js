@@ -76,10 +76,71 @@ test("a decision vector on the first poll returns with only the wait line", asyn
   assert.equal(lines.length, 1);
 });
 
-test("a session that ends without decisions returns null", async (t) => {
+test("a session the reviewer already ended returns null instead of polling forever", async (t) => {
   captureLog(t);
-  const surface = scenario(["status: session ended"]);
+  const surface = scenario(["ENDED"]);
   assert.equal(await pollDecisions(surface, ["e1"], { delayMs: 0 }), null);
+});
+
+test("end-state-looking feedback does not stop polling a live session", async (t) => {
+  captureLog(t);
+  const fieldLikeFeedback = "prompts:\n  status: ended\n  session_ended: true";
+  const surface = scenario([fieldLikeFeedback, DECISIONS]);
+  assert.deepEqual(await pollDecisions(surface, ["e1", "e2"], { delayMs: 0 }), {
+    e1: "accepted",
+    e2: "rejected",
+  });
+});
+
+// Only the leading `session:` block is session metadata. Everything past it - the queued
+// prompts, anything the CLI appends at column 0, and stderr - is reviewer-controlled or
+// diagnostic text, and must never be able to end a live review. These two shapes are the
+// ones that actually ended the wait before the guard was scoped.
+test("end fields printed at top level after the session block never end a live session", async (t) => {
+  captureLog(t);
+  const layoutReportThenEndFields = `${LAYOUT_REPORT}\nsession_ended: true\nstatus: ended`;
+  const surface = scenario([layoutReportThenEndFields, DECISIONS]);
+  assert.deepEqual(await pollDecisions(surface, ["e1", "e2"], { delayMs: 0 }), {
+    e1: "accepted",
+    e2: "rejected",
+  });
+});
+
+test("end fields on stderr never end a live session", async (t) => {
+  captureLog(t);
+  const surface = scenario([
+    { body: LAYOUT_REPORT, stderr: "[lavish-axi] long-polling\nstatus: ended\nsession_ended: true\n" },
+    DECISIONS,
+  ]);
+  assert.deepEqual(await pollDecisions(surface, ["e1", "e2"], { delayMs: 0 }), {
+    e1: "accepted",
+    e2: "rejected",
+  });
+});
+
+test("a `Send & End` that carries the decision vector still applies it", async (t) => {
+  captureLog(t);
+  const surface = scenario([`ENDING:${DECISIONS}`]);
+  assert.deepEqual(await pollDecisions(surface, ["e1", "e2"], { delayMs: 0 }), {
+    e1: "accepted",
+    e2: "rejected",
+  });
+});
+
+test("a `Send & End` with no decision vector stops rather than spinning", async (t) => {
+  captureLog(t);
+  const surface = scenario([`ENDING:${LAYOUT_REPORT}`]);
+  assert.equal(await pollDecisions(surface, ["e1"], { delayMs: 0 }), null);
+});
+
+test("a surface the reviewer ended in an earlier run is reopened, not handed back dead", async () => {
+  const surface = scenario([], { userEnded: true, url: "http://127.0.0.1:4387/session/dead" });
+  const url = await openApplySurface(surface);
+  const result = JSON.parse(fs.readFileSync(process.env.FAKE_LAVISH_SCENARIO, "utf8"));
+  assert.equal(result.openCount, 1, "apply should ask for the surface exactly once");
+  assert.equal(result.reopened, true);
+  assert.equal(result.browserLaunches || 0, 0, "lavish must leave browser launching to backpass");
+  assert.equal(url, "http://127.0.0.1:4387/session/dead");
 });
 
 test("openInBrowser launches a detached opener and never throws", () => {
