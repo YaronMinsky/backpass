@@ -35,6 +35,10 @@ export async function foldForRun(ctx, memoryFile) {
 
 export async function runProposal(ctx, precomputed = null) {
   const { repo, config } = ctx;
+  // Starting a new proposal run invalidates the previous result immediately. Discovery,
+  // folding, and agent resolution can all fail before synthesis starts; none of those
+  // failures may leave an older proposal available to apply as if it came from this run.
+  config.state.clearProposal();
   const { file } = precomputed || primaryMemoryFile(repo, config);
   const transcripts = precomputed?.transcripts || (await discoverForRun(ctx)).transcripts;
 
@@ -113,6 +117,60 @@ export function printProposal(proposal, { applied = false, analysisUsage = [] } 
   out("Review and apply with `backpass apply` (nothing has been written).");
 }
 
+/** True when a violation is about the always-loaded budget rather than the annotation. */
+const isBudgetViolation = (v) => /-token budget/.test(v);
+const isEditCapViolation = (v) => /per-run cap is \d+/.test(v);
+
+/**
+ * What to actually try next, read off the condition the run ended on.
+ *
+ * The old advice - a stronger model, a bigger budget, a higher edit cap - was printed for
+ * every failure, including the ones where the model never spoke and the ones where the
+ * budget was never the constraint. Each terminal condition has a different repair.
+ */
+export function synthesisFailureHint(err) {
+  if (err.reason === "empty") {
+    return "the synthesis harness returned no text, so nothing about the model, the budget, or the edit cap was the constraint; run `backpass propose` again to start a fresh synthesis session";
+  }
+  if (err.reason === "unparseable") {
+    return "the model answered but not with a JSON object; run `backpass propose` again, or pin a different harness with --synthesis-agent";
+  }
+  if (err.reason === "editing") {
+    return "the agent kept rewriting the staging copy instead of describing it; run `backpass propose` again to start fresh";
+  }
+  const violations = err.violations || [];
+  if (violations.some(isBudgetViolation)) {
+    return "the edit set did not clear the budget gate: raise --budget, or let the shrink continue over more runs";
+  }
+  if (violations.some(isEditCapViolation)) {
+    return "the annotation proposed more edits than the per-run learning rate allows: raise --max-edits, or re-run and let the next pass take the rest";
+  }
+  return "the gates above are what the next synthesis must satisfy; run `backpass propose` again";
+}
+
+/**
+ * Report a synthesis that ended without a valid proposal: loudly, and about the turn that
+ * actually ended it (design section 6).
+ *
+ * The saved proposal and the terminal condition can be from different turns - a run whose
+ * last turn was empty leaves the rejected proposal of an earlier one on disk - so the
+ * provenance is printed rather than letting the older violations read as this turn's.
+ */
+export function printSynthesisFailure(err, state) {
+  info("");
+  for (const violation of err.violations) info(`  ${color.red("x")} ${violation}`);
+  info("");
+  if (!err.saved) {
+    info(color.dim("  no proposal was saved: no annotation turn produced one"));
+    return;
+  }
+  info(color.dim(`  the rejected proposal was saved to ${state.proposalPath}`));
+  if (err.reason !== "gates") {
+    info(color.dim(`  it is from annotation attempt ${err.saved.attempt}, not the turn above, and it lists:`));
+    for (const violation of err.saved.violations) info(color.dim(`    - ${violation}`));
+  }
+}
+
 export async function cmdPropose(ctx) {
   try {
     const { proposal } = await runProposal(ctx);
@@ -124,12 +182,8 @@ export async function cmdPropose(ctx) {
     return 0;
   } catch (err) {
     if (err instanceof ProposalViolation) {
-      // Loud failure, never silent truncation (design section 6).
-      info("");
-      for (const violation of err.violations) info(`  ${color.red("x")} ${violation}`);
-      info("");
-      info(color.dim(`  the rejected proposal was saved to ${ctx.config.state.proposalPath}`));
-      throw new UserError(err.message, "try a stronger synthesis model, or raise --budget / --max-edits");
+      printSynthesisFailure(err, ctx.config.state);
+      throw new UserError(err.message, synthesisFailureHint(err));
     }
     throw err;
   }

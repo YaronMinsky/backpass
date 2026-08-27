@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 
 import { estimateTokens } from "./tokens.js";
 
@@ -104,19 +105,35 @@ export function renderSkillFile(skill) {
 }
 
 /**
+ * The skills one extract creates.
+ *
+ * Usually one. Several arrive together when the measurement merged their removals into a
+ * single change (`anchoredHunks`), which makes them one accept/reject decision - accepting
+ * half a merged change is not a thing a file can do. Proposals written before that was
+ * possible carry a single `skill`, so both shapes read the same way here.
+ *
+ * @returns {object[]}
+ */
+export function editSkills(edit) {
+  if (Array.isArray(edit?.skills)) return edit.skills.filter(Boolean);
+  return edit?.skill ? [edit.skill] : [];
+}
+
+/**
  * The budget arithmetic that makes extraction worth it, reported per edit:
  * "-1,900 tok always-loaded, +140 tok description".
  */
 export function extractionBudgetEffect(edit) {
-  if (edit.kind !== "extract" || !edit.skill) return null;
+  const skills = editSkills(edit);
+  if (edit.kind !== "extract" || !skills.length) return null;
   const pairs = Array.isArray(edit.hunks) ? edit.hunks : [edit];
   const removedFromMemory = pairs.reduce((sum, p) => sum + estimateTokens(p.find) - estimateTokens(p.replace), 0);
-  const descriptionCost = estimateTokens(edit.skill.description);
+  const descriptionCost = skills.reduce((sum, skill) => sum + estimateTokens(skill.description), 0);
   return {
     alwaysLoadedDelta: -removedFromMemory,
     descriptionCost,
     net: descriptionCost - removedFromMemory,
-    skillBodyTokens: estimateTokens(edit.skill.body),
+    skillBodyTokens: skills.reduce((sum, skill) => sum + estimateTokens(skill.body), 0),
   };
 }
 
@@ -169,6 +186,110 @@ function inspectClaudeSkillsLink(repoRoot) {
   return { state: "other" };
 }
 
+function pathIdentity(stat) {
+  return { dev: stat.dev, ino: stat.ino };
+}
+
+function restoreQuarantinedPath(quarantine, destination) {
+  const stat = fs.lstatSync(quarantine);
+  if (stat.isDirectory()) {
+    // Restore the directory object itself. Recursively copying it can fail for valid
+    // entries such as Unix sockets and would turn restoration into a lossy clone. On
+    // POSIX, an empty directory created with mkdir is an atomic no-clobber reservation;
+    // rename may replace that reservation, but cannot replace it after another process
+    // has populated it.
+    if (process.platform === "win32") {
+      fs.renameSync(quarantine, destination);
+      return;
+    }
+
+    fs.mkdirSync(destination, { mode: stat.mode & 0o7777 });
+    try {
+      fs.renameSync(quarantine, destination);
+    } catch (err) {
+      try {
+        fs.rmdirSync(destination);
+      } catch {
+        // Another process populated the reservation. Preserve both directory trees.
+      }
+      throw err;
+    }
+    return;
+  }
+  if (stat.isSymbolicLink()) {
+    fs.symlinkSync(fs.readlinkSync(quarantine), destination);
+    fs.unlinkSync(quarantine);
+    return;
+  }
+  fs.linkSync(quarantine, destination);
+  fs.unlinkSync(quarantine);
+}
+
+export function removeOwnedSkillPaths(paths) {
+  const removed = [];
+  const conflicts = [];
+  for (const item of [...paths].reverse()) {
+    let stat;
+    try {
+      stat = fs.lstatSync(item.absolute);
+    } catch {
+      continue;
+    }
+    const observed = pathIdentity(stat);
+    if (observed.dev !== item.identity.dev || observed.ino !== item.identity.ino) {
+      conflicts.push(item);
+      continue;
+    }
+    if (item.text !== undefined) {
+      let text;
+      try {
+        text = fs.readFileSync(item.absolute, "utf8");
+      } catch {
+        conflicts.push(item);
+        continue;
+      }
+      if (text !== item.text) {
+        conflicts.push(item);
+        continue;
+      }
+    }
+
+    // Move the pathname out of the way atomically, then validate the object that was
+    // actually moved. A second pathname check followed by unlink would let a concurrent
+    // replacement slip between those operations and be deleted as if it were ours.
+    const quarantine = path.join(
+      path.dirname(item.absolute),
+      `.${path.basename(item.absolute)}.backpass-rollback-${randomUUID()}`,
+    );
+    let quarantined = false;
+    try {
+      fs.renameSync(item.absolute, quarantine);
+      quarantined = true;
+      const moved = pathIdentity(fs.lstatSync(quarantine));
+      const identityMatches = moved.dev === item.identity.dev && moved.ino === item.identity.ino;
+      const textMatches = item.text === undefined || fs.readFileSync(quarantine, "utf8") === item.text;
+      if (identityMatches && textMatches) {
+        fs.unlinkSync(quarantine);
+        removed.push(item);
+        continue;
+      }
+
+      restoreQuarantinedPath(quarantine, item.absolute);
+      conflicts.push(item);
+    } catch {
+      if (quarantined) {
+        try {
+          restoreQuarantinedPath(quarantine, item.absolute);
+        } catch {
+          fs.existsSync(quarantine);
+        }
+      }
+      conflicts.push(item);
+    }
+  }
+  return { removed, conflicts };
+}
+
 /**
  * Create the canonical skills dir and the `.claude/skills -> ../.agents/skills` symlink
  * so both harness families load the same files with no duplication. An existing
@@ -197,11 +318,39 @@ export function ensureSkillsLayout(repoRoot) {
 }
 
 /** Write an accepted skill extraction to disk, setting up the load layout on first use. */
-export function writeSkill(repoRoot, skill) {
+export function writeSkill(repoRoot, skill, { exclusive = false, ensureLayout = true } = {}) {
   const inCanonical = skill.path === CANONICAL_SKILLS_DIR || skill.path.startsWith(`${CANONICAL_SKILLS_DIR}/`);
-  const layout = inCanonical ? ensureSkillsLayout(repoRoot) : { created: [], warnings: [] };
+  const layout = inCanonical && ensureLayout ? ensureSkillsLayout(repoRoot) : { created: [], warnings: [] };
+  const canonicalWasMissing = inCanonical && !fs.existsSync(path.join(repoRoot, CANONICAL_SKILLS_DIR));
   const target = path.join(repoRoot, skill.path);
   fs.mkdirSync(path.dirname(target), { recursive: true });
-  fs.writeFileSync(target, renderSkillFile(skill));
-  return { target, ...layout };
+  if (!ensureLayout && canonicalWasMissing) layout.created.push(CANONICAL_SKILLS_DIR);
+  const text = renderSkillFile(skill);
+  if (!exclusive) {
+    fs.writeFileSync(target, text);
+    return { target, ...layout };
+  }
+
+  let fd;
+  /** @type {{ absolute: string, identity: { dev: number, ino: number }, relative: string, text?: string }[] | undefined} */
+  let ownership;
+  try {
+    fd = fs.openSync(target, "wx");
+    ownership = [{ absolute: target, identity: pathIdentity(fs.fstatSync(fd)), relative: skill.path }];
+    fs.writeFileSync(fd, text);
+    fs.closeSync(fd);
+    fd = undefined;
+    ownership[0].text = text;
+  } catch (err) {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // Preserve the original write error.
+      }
+    }
+    removeOwnedSkillPaths(ownership ?? []);
+    throw err;
+  }
+  return { target, ...layout, ownership };
 }

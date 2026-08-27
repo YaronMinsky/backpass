@@ -1,11 +1,19 @@
 import fs from "node:fs";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 
 import { applyEdit, projectWithDecisions } from "../proposal.js";
 import { memoryTextHash } from "../memory.js";
 import { budgetGateKind, budgetStatus, formatTokens } from "../tokens.js";
 import { recordRejection } from "../state.js";
-import { writeSkill } from "../skills.js";
+import {
+  CANONICAL_SKILLS_DIR,
+  CLAUDE_SKILLS_LINK,
+  editSkills,
+  ensureSkillsLayout,
+  removeOwnedSkillPaths,
+  writeSkill,
+} from "../skills.js";
 
 function acceptedSubsetBudgetFailure({ proposal, accepted, repo, capTokens, memoryText }) {
   if (!accepted.length) return null;
@@ -98,16 +106,77 @@ function overBudgetWarning(relative, budget) {
   );
 }
 
+function atomicReplace(target, text) {
+  const temp = path.join(path.dirname(target), `.${path.basename(target)}.backpass-${randomUUID()}`);
+  const mode = fs.statSync(target).mode & 0o7777;
+  let fd;
+  let ownership;
+  try {
+    fd = fs.openSync(temp, "wx");
+    const stat = fs.fstatSync(fd);
+    ownership = [{ absolute: temp, identity: { dev: stat.dev, ino: stat.ino } }];
+    fs.fchmodSync(fd, mode);
+    fs.writeFileSync(fd, text);
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = undefined;
+    fs.renameSync(temp, target);
+    return { absolute: target, identity: ownership[0].identity, text };
+  } catch (err) {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // Preserve the original write error.
+      }
+    }
+    removeOwnedSkillPaths(ownership ?? []);
+    throw err;
+  }
+}
+
+function commitStillCurrent(commit) {
+  let stat;
+  try {
+    stat = fs.lstatSync(commit.absolute);
+    if (stat.dev !== commit.identity.dev || stat.ino !== commit.identity.ino) return false;
+    return fs.readFileSync(commit.absolute, "utf8") === commit.text;
+  } catch {
+    return false;
+  }
+}
+
+function absentParentDirectories(root, files) {
+  const directories = new Set();
+  for (const file of files) {
+    for (let current = path.dirname(file); current !== root; current = path.dirname(current)) {
+      if (!fs.existsSync(current)) directories.add(current);
+    }
+  }
+  return [...directories].sort((a, b) => b.length - a.length);
+}
+
+function removeEmptyDirectories(directories) {
+  for (const directory of directories) {
+    try {
+      fs.rmdirSync(directory);
+    } catch {
+      continue;
+    }
+  }
+}
+
 /**
  * The only place in backpass that writes to the repo.
  *
  * Everything upstream is read-only analysis; a run only changes the weights here, after
- * a human accepted specific edits. Three gates run before the first byte is written:
+ * a human accepted specific edits. Five gates run before the first byte is written:
  * the memory file must still be the file the proposal was measured against
  * (`memoryFileSnapshot`), the accepted subset must clear the same cap/shrink budget gate as
- * the full proposal (`budgetGateKind`), and every accepted edit for a file must compose
- * against that file's single pre-write image. Any of them failing writes nothing and
- * records no rejection.
+ * the full proposal (`budgetGateKind`), every accepted edit for a file must compose
+ * against that file's single pre-write image, every created skill target must still be
+ * absent, and accepted paths must resolve to distinct targets. Any of them failing writes
+ * nothing and records no rejection.
  *
  * A file is therefore applied all at once or not at all. Skills are written only after
  * every accepted edit has composed, and before the files that reference them.
@@ -197,33 +266,98 @@ export function applyDecisions({ proposal, decisions, repo, state, config, dryRu
     for (const id of applied) landed.add(id);
   }
 
+  const plannedTargets = new Map();
+  const resolvedPlanned = [];
+  for (const item of planned) {
+    let resolved;
+    try {
+      resolved = fs.realpathSync(item.absolute);
+    } catch (err) {
+      results.failed.push({ file: item.relative, error: `${item.relative} could not be resolved: ${err.message}` });
+      continue;
+    }
+    const existing = plannedTargets.get(resolved);
+    if (existing) {
+      results.failed.push({
+        file: item.relative,
+        error: `${item.relative} resolves to the same target as ${existing.relative}; nothing was written`,
+      });
+      continue;
+    }
+    const resolvedItem = { ...item, resolved };
+    plannedTargets.set(resolved, resolvedItem);
+    resolvedPlanned.push(resolvedItem);
+  }
+
   if (results.failed.length) return results;
 
   // Skills go in before the memory file. A skill nothing points at yet is inert, while a
   // memory file pointing at a skill that is not there is actively wrong - so if a skill
   // cannot be written, the files that would reference it are left alone.
-  const skillFailures = [];
-  const writtenSkillPaths = [];
+  const plannedSkills = [];
+  const skillPaths = new Set();
   for (const edit of accepted) {
-    if (edit.kind !== "extract" || !edit.skill) continue;
-    if (!landed.has(edit.id)) continue;
+    if (edit.kind !== "extract" || !landed.has(edit.id)) continue;
+    for (const skill of editSkills(edit)) {
+      const absolute = path.join(repo.root, skill.path);
+      if (skillPaths.has(skill.path) || fs.existsSync(absolute)) {
+        results.failed.push({
+          file: skill.path,
+          edit: edit.id,
+          error: `${skill.path} already exists; nothing was written`,
+        });
+      }
+      skillPaths.add(skill.path);
+      plannedSkills.push({ edit, skill });
+    }
+  }
+  if (results.failed.length) return results;
+
+  const canonical = plannedSkills.find(
+    ({ skill }) => skill.path === CANONICAL_SKILLS_DIR || skill.path.startsWith(`${CANONICAL_SKILLS_DIR}/`),
+  );
+  const createdDirectoryCandidates = absentParentDirectories(repo.root, [
+    ...plannedSkills.map(({ skill }) => path.join(repo.root, skill.path)),
+    ...(canonical ? [path.join(repo.root, CLAUDE_SKILLS_LINK)] : []),
+  ]);
+  const skillFailures = [];
+  const ownedSkillPaths = [];
+  for (const { edit, skill } of plannedSkills) {
     try {
-      const layout = dryRun ? { created: [], warnings: [] } : writeSkill(repo.root, edit.skill);
-      results.skills.push({ path: edit.skill.path, dryRun, created: layout.created });
-      if (!dryRun) writtenSkillPaths.push(edit.skill.path);
+      const layout = dryRun
+        ? { created: [], warnings: [] }
+        : writeSkill(repo.root, skill, { exclusive: true, ensureLayout: false });
+      results.skills.push({ path: skill.path, dryRun, created: layout.created });
+      if (!dryRun) {
+        ownedSkillPaths.push(...("ownership" in layout && Array.isArray(layout.ownership) ? layout.ownership : []));
+      }
       for (const w of layout.warnings) if (!results.warnings.includes(w)) results.warnings.push(w);
     } catch (err) {
-      skillFailures.push({ file: edit.skill.path, edit: edit.id, error: err.message });
+      skillFailures.push({ file: skill.path, edit: edit.id, error: err.message });
     }
   }
 
-  if (skillFailures.length) {
-    results.failed.push(...skillFailures);
-    if (writtenSkillPaths.length) {
+  const rollbackSkills = () => {
+    const { removed, conflicts } = removeOwnedSkillPaths(ownedSkillPaths);
+    removeEmptyDirectories(createdDirectoryCandidates);
+    results.skills = [];
+    const removedPaths = removed.map((item) => item.relative).filter(Boolean);
+    if (removedPaths.length) {
       results.failed.push({
-        error: `skill paths already written in this round: ${writtenSkillPaths.join(", ")}; remove them before retrying`,
+        error: `rolled back skill paths written earlier in this round: ${removedPaths.join(", ")}`,
       });
     }
+    for (const item of conflicts) {
+      results.failed.push({
+        file: item.relative,
+        error: `${item.relative} rollback conflict: the skill changed after this apply wrote it; left untouched`,
+      });
+    }
+  };
+
+  if (skillFailures.length) {
+    results.failed.push(...skillFailures);
+    rollbackSkills();
     for (const { relative } of planned) {
       results.failed.push({
         file: relative,
@@ -233,14 +367,67 @@ export function applyDecisions({ proposal, decisions, repo, state, config, dryRu
     return results;
   }
 
-  for (const { relative, absolute, before, text, applied } of planned) {
+  const orderedPlanned = [...resolvedPlanned].sort((a, b) => {
+    const aMemory = a.relative === proposal.memoryFile.path;
+    const bMemory = b.relative === proposal.memoryFile.path;
+    return Number(aMemory) - Number(bMemory);
+  });
+  const committed = [];
+  const rollbackCommitted = () => {
+    for (const written of [...committed].reverse()) {
+      if (!commitStillCurrent(written.commit)) {
+        results.failed.push({
+          file: written.relative,
+          error: `${written.relative} rollback conflict: the file changed after this apply wrote it; left untouched`,
+        });
+        continue;
+      }
+      try {
+        atomicReplace(written.commit.absolute, written.before);
+      } catch (rollbackError) {
+        results.failed.push({
+          file: written.relative,
+          error: `${written.relative} could not be rolled back: ${rollbackError.message}`,
+        });
+      }
+    }
+    results.written = [];
+  };
+  for (const item of orderedPlanned) {
+    const { relative, resolved, before, text, applied } = item;
     const budget = relative === proposal.memoryFile.path ? budgetStatus(before, text, config.budgetTokens) : null;
 
-    if (!dryRun) fs.writeFileSync(absolute, text);
+    let commit = null;
+    try {
+      if (!dryRun) commit = atomicReplace(resolved, text);
+    } catch (err) {
+      results.failed.push({
+        file: relative,
+        error: `${relative} could not be written: ${err.message}`,
+      });
+      rollbackCommitted();
+      rollbackSkills();
+      return results;
+    }
+    committed.push({ ...item, commit });
     results.written.push({ file: relative, edits: applied, budget, dryRun });
 
     // Shrinking over several runs is the design, so this is a heading, not a failure.
     if (budget && !budget.withinBudget) results.warnings.push(overBudgetWarning(relative, budget));
+  }
+
+  if (!dryRun && canonical) {
+    try {
+      const layout = ensureSkillsLayout(repo.root);
+      const result = results.skills.find(({ path: skillPath }) => skillPath === canonical.skill.path);
+      result.created = [...new Set([...result.created, ...layout.created])];
+      for (const w of layout.warnings) if (!results.warnings.includes(w)) results.warnings.push(w);
+    } catch (err) {
+      results.failed.push({ file: CLAUDE_SKILLS_LINK, edit: canonical.edit.id, error: err.message });
+      rollbackCommitted();
+      rollbackSkills();
+      return results;
+    }
   }
 
   // Rejections are remembered so the same edit is not re-proposed without new evidence.

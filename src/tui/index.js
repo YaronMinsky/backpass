@@ -103,6 +103,7 @@ export function initialState(meta) {
       instructions: 0,
       suppressed: 0,
       violations: [],
+      annotateCondition: null,
       edits: 0,
     },
   };
@@ -233,6 +234,17 @@ export function reduceEvent(state, event, data, now = Date.now()) {
       break;
     case "synth:violations":
       s.violations = data.violations || [];
+      s.annotateCondition = null;
+      break;
+    // Neither of these is a rejected answer, so neither clears into the violations list:
+    // the files moved under the ids, or the harness said nothing at all.
+    case "synth:remeasure":
+      s.annotateCondition = "remeasure";
+      s.violations = [];
+      break;
+    case "synth:empty":
+      s.annotateCondition = "empty";
+      s.violations = [];
       break;
     case "synth:done":
       s.status = "done";
