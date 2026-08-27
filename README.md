@@ -249,7 +249,24 @@ edit is not proposed again unless materially new evidence arrives.
 The live budget gauge is not just a readout. Apply rechecks the accepted subset against
 the same budget gate as synthesis: stay under the cap, or shrink if the file is already
 over. An incompatible set writes nothing and does not record rejections, so you can pick
-a compatible set and try again.
+a compatible set and try again. If the run shrinks the file but leaves it above the cap,
+that is progress, not a failure: it is written, and the remaining overage is printed.
+
+Apply preflights every accepted edit before writing. The proposal was measured against one
+exact version of your memory file, so apply first checks the file still exists and is still
+that version. If it was removed or changed since - you pulled, edited it by hand, or another
+agent did - the edits no longer describe what is on disk, so nothing is written and you are
+told to run `backpass` again to re-propose against the current file. Within a run every file
+is composed from one version: it takes every accepted edit or none of them.
+
+Skills are written only after every edit has composed, and before the memory file, so a
+write failure cannot leave the memory file pointing at a missing skill. If one skill write
+fails after another succeeded, apply names the unreferenced skill paths to remove before
+retrying.
+
+For compatibility, proposals created by older backpass versions that do not contain a
+memory-file hash skip the freshness check. Regenerate such a proposal before applying it if
+the repository may have changed.
 
 ```sh
 backpass apply --no-ui     # same decision, in the terminal

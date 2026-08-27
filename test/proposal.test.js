@@ -530,7 +530,7 @@ test("rejecting every edit remains valid when memory already exceeds the cap", (
   assert.equal(Object.keys(state.readRejections().entries).length, 1);
 });
 
-test("apply preflight skips inapplicable accepted edits and still writes the rest", () => {
+test("one inapplicable accepted edit leaves the whole file unwritten", () => {
   const { proposal, repo, state } = gate({
     edit: memoryEdit((t) => t.replace("- Use Node 18 via nvm before running any script.\n", "")),
     annotation: { edits: [claim(["H1"], { kind: "remove", title: "drop node pin" })] },
@@ -549,10 +549,227 @@ test("apply preflight skips inapplicable accepted edits and still writes the res
     config: { budgetTokens: 5000 },
   });
 
-  assert.equal(results.written.length, 1);
+  assert.deepEqual(results.written, [], "a file takes every accepted edit or none of them");
+  assert.equal(
+    fs.readFileSync(path.join(repo.root, "AGENTS.md"), "utf8"),
+    MEMORY_TEXT,
+    "the applicable edit is not written either",
+  );
+  assert.ok(
+    results.failed.some((f) => f.edit === "e-stale" && /does not appear/.test(f.error)),
+    "the edit that could not apply is named",
+  );
+  assert.ok(
+    results.failed.some((f) => !f.edit && /left unchanged/.test(f.error)),
+    "and so is the consequence for the file",
+  );
+});
+
+test("a stale edit in another file aborts the whole accepted run", () => {
+  const skill = "---\nname: db\ndescription: old trigger\n---\n\nbody\n";
+  const { proposal, repo, state } = gate({
+    files: { ".agents/skills/db/SKILL.md": skill },
+    edit: (root) => {
+      writeIn(root, "AGENTS.md", (text) =>
+        text
+          .replace("- Use Node 18 via nvm before running any script.\n", "")
+          .replace("include its URL.", "include its full https:// URL."),
+      );
+      writeIn(root, ".agents/skills/db/SKILL.md", (text) =>
+        text.replace("old trigger", "Load before touching the database."),
+      );
+    },
+    annotation: {
+      edits: [
+        claim(["H2"], { kind: "remove", title: "drop node pin" }),
+        claim(["H1"], { title: "expand URL rule" }),
+        claim(["H3"], { title: "fix skill trigger" }),
+      ],
+    },
+  });
+  proposal.edits[2].hunks[0].find = "stale skill text";
+
+  const results = applyDecisions({
+    proposal,
+    decisions: { e1: "accepted", e2: "rejected", e3: "accepted" },
+    repo,
+    state,
+    config: { budgetTokens: 5000 },
+  });
+
+  assert.deepEqual(results.written, []);
+  assert.equal(fs.readFileSync(path.join(repo.root, "AGENTS.md"), "utf8"), MEMORY_TEXT);
+  assert.equal(fs.readFileSync(path.join(repo.root, ".agents/skills/db/SKILL.md"), "utf8"), skill);
+  assert.equal(results.rejectionsRecorded, false);
+  assert.equal(Object.keys(state.readRejections().entries).length, 0);
+  assert.ok(results.failed.some((failure) => failure.edit === "e3" && /does not appear/.test(failure.error)));
+});
+
+test("apply refuses every edit once the memory file changed under the proposal", () => {
+  const { proposal, repo, state } = gate({
+    edit: memoryEdit((t) => t.replace("- Prefer small commits.", "- Prefer small, reviewable commits.")),
+    annotation: { edits: [claim(["H1"], { title: "sharpen the commit rule" })] },
+  });
+
+  // The drift is somewhere else in the file, so the hunk itself would still apply.
+  const memory = path.join(repo.root, "AGENTS.md");
+  const drifted = MEMORY_TEXT.replace("## Rules\n", "## Rules\n\n- Run the linter before pushing.\n");
+  fs.writeFileSync(memory, drifted);
+  assert.doesNotThrow(() => applyEdit(drifted, proposal.edits[0]), "the edit still composes; only the file moved");
+
+  const results = applyDecisions({
+    proposal,
+    decisions: { e1: "accepted" },
+    repo,
+    state,
+    config: { budgetTokens: 5000 },
+  });
+
+  assert.deepEqual(results.written, []);
+  assert.equal(fs.readFileSync(memory, "utf8"), drifted, "the drifted file is left exactly as found");
   assert.equal(results.failed.length, 1);
-  assert.equal(results.failed[0].edit, "e-stale");
-  assert.ok(!fs.readFileSync(path.join(repo.root, "AGENTS.md"), "utf8").includes("Node 18"));
+  assert.match(results.failed[0].error, /changed after this proposal was made/);
+  assert.match(results.failed[0].error, new RegExp(proposal.memoryFile.hash), "names the image it was measured on");
+  assert.match(results.failed[0].error, /Run `backpass`/, "names the command that re-measures");
+});
+
+test("memory drift also refuses an all-rejected decision without recording it", () => {
+  const { proposal, repo, state } = gate({
+    edit: memoryEdit((text) => text.replace("- Prefer small commits.", "- Prefer small, reviewable commits.")),
+    annotation: { edits: [claim(["H1"], { title: "sharpen the commit rule" })] },
+  });
+  const memory = path.join(repo.root, "AGENTS.md");
+  const drifted = MEMORY_TEXT.replace("## Rules\n", "## Rules\n\n- Run the linter before pushing.\n");
+  fs.writeFileSync(memory, drifted);
+
+  const results = applyDecisions({
+    proposal,
+    decisions: { e1: "rejected" },
+    repo,
+    state,
+    config: { budgetTokens: 5000 },
+  });
+
+  assert.deepEqual(results.written, []);
+  assert.equal(fs.readFileSync(memory, "utf8"), drifted);
+  assert.equal(results.rejectionsRecorded, false);
+  assert.equal(Object.keys(state.readRejections().entries).length, 0);
+  assert.match(results.failed[0].error, /changed after this proposal was made/);
+});
+
+test("a missing memory file refuses an all-rejected decision without recording it", () => {
+  const { proposal, repo, state } = gate({
+    edit: memoryEdit((text) => text.replace("- Prefer small commits.", "- Prefer small, reviewable commits.")),
+    annotation: { edits: [claim(["H1"], { title: "sharpen the commit rule" })] },
+  });
+  const memory = path.join(repo.root, "AGENTS.md");
+  fs.rmSync(memory);
+
+  const results = applyDecisions({
+    proposal,
+    decisions: { e1: "rejected" },
+    repo,
+    state,
+    config: { budgetTokens: 5000 },
+  });
+
+  assert.deepEqual(results.written, []);
+  assert.equal(results.rejectionsRecorded, false);
+  assert.equal(Object.keys(state.readRejections().entries).length, 0);
+  assert.match(results.failed[0].error, /AGENTS\.md no longer exists/);
+  assert.match(results.failed[0].error, /Run `backpass`/);
+});
+
+test("an unchanged memory file still applies, so the freshness check costs nothing", () => {
+  const { proposal, repo, state } = gate({
+    edit: memoryEdit((t) => t.replace("- Prefer small commits.", "- Prefer small, reviewable commits.")),
+    annotation: { edits: [claim(["H1"], { title: "sharpen the commit rule" })] },
+  });
+
+  const results = applyDecisions({
+    proposal,
+    decisions: { e1: "accepted" },
+    repo,
+    state,
+    config: { budgetTokens: 5000 },
+  });
+
+  assert.deepEqual(results.failed, []);
+  assert.equal(results.written.length, 1);
+  assert.match(fs.readFileSync(path.join(repo.root, "AGENTS.md"), "utf8"), /small, reviewable commits/);
+});
+
+test("a skill is written only when the memory-file edit that points at it lands", () => {
+  const skillText = "---\nname: node-setup\ndescription: Load before running any script.\n---\n\nuse nvm\n";
+  const { proposal, repo, state } = gate({
+    edit: (root) => {
+      writeIn(root, "AGENTS.md", (t) =>
+        t.replace("- Use Node 18 via nvm before running any script.", "- Load the node-setup skill."),
+      );
+      writeIn(root, ".agents/skills/node-setup/SKILL.md", skillText);
+    },
+    annotation: { edits: [claim(["H1", "H2"], { kind: "extract", title: "extract the node pin" })] },
+  });
+  proposal.edits[0].hunks[0].find = "text that is not in the file at all";
+
+  const results = applyDecisions({
+    proposal,
+    decisions: { e1: "accepted" },
+    repo,
+    state,
+    config: { budgetTokens: 5000 },
+  });
+
+  assert.deepEqual(results.skills, [], "no skill for an edit that did not land");
+  assert.equal(fs.existsSync(path.join(repo.root, ".agents/skills/node-setup/SKILL.md")), false);
+  assert.equal(fs.existsSync(path.join(repo.root, ".claude/skills")), false, "and no layout side effects");
+});
+
+test("a failed later skill write names skill paths already written", () => {
+  const skillText = "---\nname: node-setup\ndescription: Load before running any script.\n---\n\nuse nvm\n";
+  const { proposal, repo, state } = gate({
+    edit: (root) => {
+      writeIn(root, "AGENTS.md", (text) =>
+        text.replace("- Use Node 18 via nvm before running any script.", "- Load the node-setup skill."),
+      );
+      writeIn(root, ".agents/skills/node-setup/SKILL.md", skillText);
+    },
+    annotation: { edits: [claim(["H1", "H2"], { kind: "extract", title: "extract the node pin" })] },
+  });
+  const second = structuredClone(proposal.edits[0]);
+  second.id = "e2";
+  second.hunks = [
+    {
+      id: "H-extra",
+      find: "- Whenever a PR is mentioned, include its URL.",
+      replace: "- See the url-policy skill.",
+    },
+  ];
+  second.skill = {
+    ...second.skill,
+    name: "url-policy",
+    path: ".agents/skills",
+    body: "Always include the full URL.",
+  };
+  proposal.edits.push(second);
+
+  const results = applyDecisions({
+    proposal,
+    decisions: { e1: "accepted", e2: "accepted" },
+    repo,
+    state,
+    config: { budgetTokens: 5000 },
+  });
+
+  assert.deepEqual(results.written, []);
+  assert.equal(fs.readFileSync(path.join(repo.root, "AGENTS.md"), "utf8"), MEMORY_TEXT);
+  assert.equal(fs.existsSync(path.join(repo.root, ".agents/skills/node-setup/SKILL.md")), true);
+  assert.ok(
+    results.failed.some(
+      (failure) =>
+        /already written/.test(failure.error) && failure.error.includes(".agents/skills/node-setup/SKILL.md"),
+    ),
+  );
 });
 
 test("an accepted extract writes the skill the agent drafted, in the canonical layout", () => {
