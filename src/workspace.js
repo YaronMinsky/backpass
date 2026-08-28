@@ -1,7 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import { anchoredHunks } from "./diff.js";
+import { anchoredHunks, countOccurrences, span } from "./diff.js";
+import { parseMemoryUnits } from "./memory.js";
 import { parseFrontmatter } from "./skills.js";
 import { sha256 } from "./state.js";
 
@@ -95,6 +96,102 @@ export function parseSkillFile(relative, text) {
 }
 
 /**
+ * One line's identity for extraction-recovery checks: verbatim modulo the noise a
+ * faithful move is allowed to make. Unicode dashes fold to "-" (house style normalizes
+ * them during moves) and interior whitespace collapses; anything more is a real change.
+ */
+export function normalizeRecoveryLine(line) {
+  return String(line ?? "")
+    .replace(/[‐-―−]/g, "-")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/** The normalized non-blank lines of a set of file texts, with occurrence counts. */
+export function recoveredLineCounts(texts) {
+  const counts = new Map();
+  for (const text of texts) {
+    for (const line of String(text ?? "").split("\n")) {
+      const normalized = normalizeRecoveryLine(line);
+      if (normalized) counts.set(normalized, (counts.get(normalized) || 0) + 1);
+    }
+  }
+  return counts;
+}
+
+/**
+ * Split one pure-removal memory-file hunk at the boundary between text that lands in a
+ * created skill and text that vanishes. Adjacent removals merge into one measured change
+ * (`anchoredHunks`), so without this split an extraction and an unrelated deletion that
+ * happen to sit next to each other in the file fuse into a single accept/reject decision.
+ * The boundary is a decision boundary, and it falls on instruction-unit edges because a
+ * skill carries whole sections.
+ *
+ * Returns the sub-hunks, or null when there is nothing to split (one kind only) or the
+ * split cannot be anchored safely (a sub-hunk's bare text is not unique in the file -
+ * widening it with context could overlap its sibling, so the merged hunk is kept instead).
+ */
+export function splitRemovalHunk(hunk, { oldText, oldLines, recovered }) {
+  const lineKinds = new Map();
+  for (let lineNo = hunk.oldStart; lineNo <= hunk.oldEnd; lineNo += 1) {
+    const normalized = normalizeRecoveryLine(oldLines[lineNo - 1]);
+    if (!normalized) continue;
+    const remaining = recovered.get(normalized) || 0;
+    lineKinds.set(lineNo, remaining > 0 ? "recovered" : "deleted");
+    if (remaining > 0) recovered.set(normalized, remaining - 1);
+  }
+
+  for (const unit of parseMemoryUnits(oldText)) {
+    const start = Math.max(unit.startLine, hunk.oldStart);
+    const end = Math.min(unit.endLine, hunk.oldEnd);
+    if (start > end) continue;
+    const kinds = new Set();
+    for (let lineNo = start; lineNo <= end; lineNo += 1) {
+      if (lineKinds.has(lineNo)) kinds.add(lineKinds.get(lineNo));
+    }
+    if (kinds.size > 1) return null;
+  }
+
+  for (let lineNo = hunk.oldStart; lineNo <= hunk.oldEnd; lineNo += 1) {
+    if (!/^#{1,6}\s+/.test(oldLines[lineNo - 1] || "")) continue;
+    let contentLine = lineNo + 1;
+    while (contentLine <= hunk.oldEnd && !normalizeRecoveryLine(oldLines[contentLine - 1])) contentLine += 1;
+    if (contentLine > hunk.oldEnd || /^#{1,6}\s+/.test(oldLines[contentLine - 1] || "")) continue;
+    if (lineKinds.get(lineNo) !== lineKinds.get(contentLine)) return null;
+  }
+
+  // Group the removed lines into maximal runs by recovery; blank lines never start a
+  // run and attach to whichever run surrounds them.
+  const runs = [];
+  for (let lineNo = hunk.oldStart; lineNo <= hunk.oldEnd; lineNo += 1) {
+    const kind = lineKinds.get(lineNo);
+    if (!kind) continue;
+    const current = runs[runs.length - 1];
+    if (current && current.kind === kind) current.last = lineNo;
+    else runs.push({ kind, first: lineNo, last: lineNo });
+  }
+  if (runs.length < 2) return null;
+
+  const subHunks = runs.map((run, index) => {
+    const start = index === 0 ? hunk.oldStart : runs[index - 1].last + 1;
+    const end = index === runs.length - 1 ? hunk.oldEnd : run.last;
+    const find = span(oldLines, start - 1, end);
+    return {
+      find,
+      replace: "",
+      oldStart: start,
+      oldEnd: end,
+      removed: end - start + 1,
+      added: 0,
+      lines: oldLines.slice(start - 1, end).map((text) => ({ type: "del", text })),
+    };
+  });
+
+  if (subHunks.some((sub) => !sub.find || countOccurrences(oldText, sub.find) !== 1)) return null;
+  return subHunks;
+}
+
+/**
  * Everything that differs between the originals and the workspace now, as changes with
  * stable ids the annotate turn refers to:
  *
@@ -136,6 +233,27 @@ export function measureWorkspace(workspace) {
     const text = fs.readFileSync(path.join(root, relative), "utf8");
     texts.set(relative, text);
     changes.push({ kind: "created", file: relative, text, skill: parseSkillFile(relative, text) });
+  }
+
+  // With the created files known, split any memory-file removal that mixes extracted
+  // text (recovered in a created file) with deleted text, so the deletion is its own
+  // measured change and stays independently decidable.
+  const createdTexts = changes.filter((c) => c.kind === "created").map((c) => c.text);
+  if (createdTexts.length) {
+    const recovered = recoveredLineCounts(createdTexts);
+    const oldText = originals.get(memoryPath) ?? "";
+    const oldLines = oldText.split("\n");
+    const measured = [];
+    for (const change of changes) {
+      if (change.kind !== "hunk" || change.file !== memoryPath || !change.removed || change.added) {
+        measured.push(change);
+        continue;
+      }
+      const subHunks = splitRemovalHunk(change, { oldText, oldLines, recovered });
+      if (subHunks) measured.push(...subHunks.map((sub) => ({ kind: "hunk", file: memoryPath, ...sub })));
+      else measured.push(change);
+    }
+    changes.splice(0, changes.length, ...measured);
   }
 
   changes.forEach((change, index) => {
