@@ -9,8 +9,8 @@ import { fileURLToPath } from "node:url";
 import { bootstrapRun } from "../src/commands/bootstrap.js";
 import { renderPointer, renderStarterMemory } from "../src/bootstrap.js";
 import { loadConfig } from "../src/config.js";
-import { setLoggerSink } from "../src/logger.js";
-import { isPointerTo, parseMemoryUnits } from "../src/memory.js";
+import { UserError, setLoggerSink } from "../src/logger.js";
+import { isPointerTo, memorySetHash, memoryTextHash, parseMemoryUnits } from "../src/memory.js";
 import { State } from "../src/state.js";
 
 const CLI = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../bin/backpass");
@@ -209,10 +209,53 @@ test("with transcripts: analysis gaps become the first evidence-backed instructi
   );
   assert.equal(fs.readFileSync(path.join(repo.root, "CLAUDE.md"), "utf8"), renderPointer("AGENTS.md"));
 
+  const bootstrapHash = memorySetHash([
+    { path: "AGENTS.md", hash: memoryTextHash(renderStarterMemory({ repo })) },
+    { path: "CLAUDE.md", hash: memoryTextHash(renderPointer("AGENTS.md")) },
+  ]);
+  assert.deepEqual(
+    ctx.config.state.listEvidence().map((e) => e.memoryHash),
+    [bootstrapHash, bootstrapHash],
+    "bootstrap evidence uses the effective memory-set hash that a later proposal fold expects",
+  );
+
   // The applied proposal is marked so `backpass apply` cannot replay it onto the new file.
   const saved = ctx.config.state.readProposal();
   assert.equal(saved.appliedBy, "bootstrap");
   assert.ok(saved.appliedAt);
+});
+
+test("bootstrap aborts analysis when the canonical memory file appears during discovery", async () => {
+  const repo = makeRepo();
+  const ctx = makeCtx(repo);
+  let analyzed = false;
+  const discoverWithConcurrentMemory = async () => {
+    fs.writeFileSync(path.join(repo.root, "AGENTS.md"), "# Concurrent instructions\n\n- Keep this file.\n");
+    return discoverTwo();
+  };
+
+  await assert.rejects(
+    () =>
+      withSink(() =>
+        bootstrapRun(ctx, {
+          discover: discoverWithConcurrentMemory,
+          analyze: async () => {
+            analyzed = true;
+          },
+        }),
+      ),
+    (error) =>
+      error instanceof UserError &&
+      /changed while backpass was bootstrapping/.test(error.message) &&
+      /run `backpass` again/.test(error.hint),
+  );
+
+  assert.equal(analyzed, false);
+  assert.equal(
+    fs.readFileSync(path.join(repo.root, "AGENTS.md"), "utf8"),
+    "# Concurrent instructions\n\n- Keep this file.\n",
+  );
+  assert.deepEqual(ctx.config.state.listEvidence(), []);
 });
 
 test("bootstrap never overwrites: a CLAUDE.md that appears is kept, only the missing file is created", async () => {
