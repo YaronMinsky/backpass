@@ -4,17 +4,19 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { capTranscripts, recencyWeight, sampleTranscripts, seededRandom } from "../src/sample.js";
+import { capTranscripts, recencyWeight, sampleTranscripts, sampleUnit } from "../src/sample.js";
 import { CONFIG_FILENAME, loadConfig, parseMaxTranscripts } from "../src/config.js";
+import { transcriptIdentity } from "../src/transcript.js";
 import { UserError, setLoggerSink } from "../src/logger.js";
 
 const DAY = 86_400_000;
 const NOW = Date.UTC(2026, 7, 22);
 
 /** `count` transcripts spread evenly over `spanDays`, newest first like discovery. */
-function transcripts(count, spanDays) {
+function transcripts(count, spanDays, { harness = "claude", offset = 0 } = {}) {
   return Array.from({ length: count }, (_, i) => ({
-    id: `t${i}`,
+    harness,
+    id: `t${i + offset}`,
     startedAt: NOW - (i * spanDays * DAY) / count,
     mtimeMs: 0,
   }));
@@ -37,18 +39,46 @@ function captureInfo(fn) {
   return lines;
 }
 
-test("the seeded RNG is deterministic and uniform on [0, 1)", () => {
-  const a = seededRandom(42);
-  const b = seededRandom(42);
-  const seq = Array.from({ length: 1000 }, () => a());
-  assert.deepEqual(
-    seq,
-    Array.from({ length: 1000 }, () => b()),
+test("sampleUnit is deterministic per transcript identity, uniform, and seed-sensitive", () => {
+  const t = { harness: "claude", id: "abc" };
+  assert.equal(
+    sampleUnit(t, 1),
+    sampleUnit({ harness: "claude", id: "abc" }, 1),
+    "same identity, same seed -> same draw",
   );
+  assert.notEqual(sampleUnit(t, 1), sampleUnit(t, 2), "a different seed draws differently");
+  assert.notEqual(
+    sampleUnit(t, undefined),
+    sampleUnit({ harness: "claude", id: "abd" }, undefined),
+    "a different identity draws differently",
+  );
+  assert.equal(sampleUnit(t, null), sampleUnit(t, undefined), "null and undefined seed both mean unseeded");
+
+  const set = Array.from({ length: 1000 }, (_, i) => ({ harness: "claude", id: `t${i}` }));
+  const seq = set.map((transcript) => sampleUnit(transcript, 7));
   assert.ok(seq.every((x) => x >= 0 && x < 1));
   const mean = seq.reduce((s, x) => s + x, 0) / seq.length;
   assert.ok(Math.abs(mean - 0.5) < 0.05, `mean ${mean} is not close to 0.5`);
-  assert.notEqual(seededRandom(1)(), seededRandom(2)());
+  assert.equal(new Set(seq).size, seq.length, "distinct identities draw distinct values in practice");
+});
+
+test("transcript identity combines harness, native id, and durable source without using titles", () => {
+  const original = { harness: "claude", nativeId: "s1", path: "/store/a.jsonl", title: "Fix the bug" };
+  assert.equal(transcriptIdentity(original), transcriptIdentity({ ...original, title: "Totally different title" }));
+  assert.notEqual(
+    transcriptIdentity(original),
+    transcriptIdentity({ ...original, harness: "codex" }),
+    "the same native id under a different harness is a different identity",
+  );
+  assert.notEqual(
+    transcriptIdentity(original),
+    transcriptIdentity({ ...original, path: "/store/b.jsonl" }),
+    "colliding native ids at different sources remain distinct",
+  );
+  assert.equal(
+    transcriptIdentity(original),
+    transcriptIdentity({ ...original, identity: transcriptIdentity(original) }),
+  );
 });
 
 test("weight halves every half-life and never reaches zero", () => {
@@ -86,6 +116,102 @@ test("over the cap exactly `cap` are kept, in discovery order, reproducibly per 
     a,
     "a different seed yields a different sample",
   );
+});
+
+test("with no --seed the default draw is deterministic across separate runs (no persisted state)", () => {
+  const set = transcripts(147, 200);
+  const a = sampleTranscripts(set, 100, { now: NOW });
+  const b = sampleTranscripts(set, 100, { now: NOW });
+  assert.equal(a.length, 100);
+  assert.deepEqual(a, b, "an unchanged rerun with no seed selects the identical sample");
+});
+
+test("reordering the discovered array changes only display order, never which transcripts are sampled", () => {
+  const set = transcripts(147, 200);
+  const reversed = [...set].reverse();
+  const shuffled = [...set].sort((a, b) => (a.id > b.id ? 1 : -1));
+  const idsOf = (kept) => new Set(kept.map((t) => t.id));
+
+  const baseline = idsOf(sampleTranscripts(set, 100, { now: NOW }));
+  assert.deepEqual(idsOf(sampleTranscripts(reversed, 100, { now: NOW })), baseline);
+  assert.deepEqual(idsOf(sampleTranscripts(shuffled, 100, { now: NOW })), baseline);
+});
+
+test("growing the corpus is sticky: previously sampled transcripts stay sampled except where new ones outcompete them", () => {
+  // The captain's exact reproduction: 147 discovered, capped to 100.
+  const base = transcripts(147, 200);
+  const before = new Set(sampleTranscripts(base, 100, { now: NOW }).map((t) => t.id));
+  assert.equal(before.size, 100);
+
+  // 20 new sessions land at arbitrary positions, with the same age distribution as the
+  // rest - a fresh random draw would reshuffle everyone; a sticky one can only ever have
+  // new items displace old ones, never the reverse, so the intersection is bounded below
+  // by count - inserted.
+  const inserted = transcripts(20, 200, { offset: 1000 });
+  const insertedIds = new Set(inserted.map((t) => t.id));
+  const grown = [...base.slice(0, 60), ...inserted, ...base.slice(60)];
+  assert.equal(grown.length, 167);
+
+  const after = sampleTranscripts(grown, 100, { now: NOW });
+  assert.equal(after.length, 100);
+  const afterIds = new Set(after.map((t) => t.id));
+  const stillKept = [...before].filter((id) => afterIds.has(id));
+  assert.ok(
+    stillKept.length >= 100 - inserted.length,
+    `expected at least ${100 - inserted.length} of the original 100 to survive, got ${stillKept.length}`,
+  );
+
+  // Not a fluke of an unusually small displacement: some genuine competition happened.
+  const newlyKept = after.filter((t) => insertedIds.has(t.id)).length;
+  assert.ok(newlyKept > 0, "at least one inserted transcript should have won a slot");
+});
+
+test("raising the cap only adds to the sample; it never drops what a smaller cap already kept", () => {
+  const set = transcripts(300, 90);
+  const small = new Set(sampleTranscripts(set, 50, { now: NOW }).map((t) => t.id));
+  const medium = new Set(sampleTranscripts(set, 100, { now: NOW }).map((t) => t.id));
+  const large = new Set(sampleTranscripts(set, 150, { now: NOW }).map((t) => t.id));
+  assert.ok(
+    [...small].every((id) => medium.has(id)),
+    "cap 50 is a subset of cap 100",
+  );
+  assert.ok(
+    [...medium].every((id) => large.has(id)),
+    "cap 100 is a subset of cap 150",
+  );
+});
+
+test("undated transcripts and duplicate-looking titles never crash or collide the sample", () => {
+  const set = [
+    ...transcripts(50, 60),
+    ...Array.from({ length: 5 }, (_, i) => ({ harness: "claude", id: `undated${i}`, title: "Untitled" })),
+  ];
+  const kept = sampleTranscripts(set, 40, { now: NOW });
+  assert.equal(kept.length, 40);
+  assert.equal(new Set(kept.map((t) => t.id)).size, 40, "no duplicate selections");
+});
+
+test("every supported harness's id namespace is sampled independently, never deduped across harnesses", () => {
+  const harnesses = ["claude", "codex", "pi", "opencode", "grok", "cursor", "hermes", "cursor-ide"];
+  const set = harnesses.map((harness) => ({ harness, id: "s1", startedAt: NOW, mtimeMs: 0 }));
+  const kept = sampleTranscripts(set, harnesses.length - 1, { now: NOW });
+  assert.equal(kept.length, harnesses.length - 1, "same id under each harness is a distinct sampling entry");
+  assert.equal(new Set(kept.map((t) => t.harness)).size, kept.length);
+});
+
+test("colliding native ids select the same source regardless of discovery order", () => {
+  const distinct = transcripts(8, 60);
+  const dupA = { harness: "claude", nativeId: "dup", id: "claude-dup", path: "/store/a.jsonl" };
+  const dupB = { harness: "claude", nativeId: "dup", id: "claude-dup", path: "/store/b.jsonl" };
+  const selectedCollision = (set) =>
+    sampleTranscripts(set, 9, { now: NOW })
+      .filter((transcript) => transcript.nativeId === "dup")
+      .map((transcript) => transcriptIdentity(transcript));
+
+  const forward = selectedCollision([...distinct, dupA, dupB]);
+  const reversed = selectedCollision([dupB, dupA, ...distinct]);
+  assert.equal(forward.length, 1, "the cap forces exactly one colliding native id out");
+  assert.deepEqual(reversed, forward, "reordering cannot change which durable source survives");
 });
 
 test("recent transcripts are favored over old ones", () => {

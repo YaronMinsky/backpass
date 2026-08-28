@@ -5,6 +5,7 @@ import crypto from "node:crypto";
 import { STATE_DIRNAME } from "./config.js";
 import { warn } from "./logger.js";
 import { ensureLocalExclude } from "./repo.js";
+import { transcriptIdentity } from "./transcript.js";
 
 /** The line every command writes to the repo's local git exclude for the state dir. */
 export const STATE_EXCLUDE_LINE = `${STATE_DIRNAME}/`;
@@ -16,7 +17,7 @@ export const STATE_EXCLUDE_LINE = `${STATE_DIRNAME}/`;
  * the tracked `.gitignore`:
  *
  *   scan-cache.json        path+mtime+size -> association verdict (design section 2.2)
- *   evidence/<id>.json     per-transcript tier-1 analysis output (design section 3)
+ *   evidence/<identity>.json per-transcript tier-1 analysis output (design section 3)
  *   evidence-summary.json  folded evidence (stage 2)
  *   proposal.json          latest parseable tier-2 synthesis; absent if none was produced (stage 3)
  *   rejections.json        edits the human rejected, and the evidence weight behind them
@@ -76,25 +77,58 @@ export class State {
     this.writeJsonFile(this.scanCachePath, cache);
   }
 
-  evidencePath(transcriptId) {
-    return path.join(this.evidenceDir, `${safeFileName(transcriptId)}.json`);
+  evidencePath(transcript) {
+    const identity = transcript && typeof transcript === "object" ? transcriptIdentity(transcript) : transcript;
+    return path.join(this.evidenceDir, `${safeFileName(identity)}.json`);
   }
 
-  readEvidence(transcriptId) {
-    return this.readJsonFile(this.evidencePath(transcriptId), null);
+  readEvidence(transcript) {
+    const currentPath = this.evidencePath(transcript);
+    const current = this.readJsonFile(currentPath, null);
+    if (!transcript || typeof transcript !== "object") return current;
+
+    const identity = transcriptIdentity(transcript);
+    const legacyPath = this.evidencePath(transcript.id);
+    if (legacyPath === currentPath) return current;
+    const legacy = this.readJsonFile(legacyPath, null);
+    const legacyMatches = legacy?.transcript && transcriptIdentity(legacy.transcript) === identity;
+    if (current) {
+      const currentMatches = current.transcript && transcriptIdentity(current.transcript) === identity;
+      const migrated = currentMatches ? migrateEvidenceRecord(current, transcript, identity) : current;
+      if (migrated !== current) this.writeJsonFile(currentPath, migrated);
+      if (legacyMatches) fs.rmSync(legacyPath, { force: true });
+      return migrated;
+    }
+    if (!legacyMatches) return null;
+
+    const migrated = migrateEvidenceRecord(legacy, transcript, identity);
+    // Publish the upgraded record atomically before removing the legacy path. If the
+    // process stops between these operations, the next read prefers the valid canonical
+    // record and merely cleans up the duplicate.
+    this.writeJsonFile(currentPath, migrated);
+    fs.rmSync(legacyPath, { force: true });
+    return migrated;
   }
 
-  writeEvidence(transcriptId, evidence) {
-    this.writeJsonFile(this.evidencePath(transcriptId), evidence);
+  writeEvidence(transcript, evidence) {
+    this.writeJsonFile(this.evidencePath(transcript), evidence);
   }
 
   listEvidence() {
     if (!fs.existsSync(this.evidenceDir)) return [];
-    return fs
+    const records = fs
       .readdirSync(this.evidenceDir)
-      .filter((f) => f.endsWith(".json"))
-      .map((f) => this.readJsonFile(path.join(this.evidenceDir, f), null))
-      .filter(Boolean);
+      .filter((file) => file.endsWith(".json"))
+      .map((file) => ({ file, record: this.readJsonFile(path.join(this.evidenceDir, file), null) }))
+      .filter(({ record }) => Boolean(record));
+    const unique = new Map();
+    for (const item of records) {
+      const identity = item.record.transcript ? transcriptIdentity(item.record.transcript) : `file:${item.file}`;
+      const canonical = item.record.transcript ? path.basename(this.evidencePath(item.record.transcript)) : item.file;
+      const existing = unique.get(identity);
+      if (!existing || item.file === canonical) unique.set(identity, item);
+    }
+    return [...unique.values()].map(({ record }) => record);
   }
 
   readSummary() {
@@ -158,12 +192,23 @@ export function sha256(text) {
   return crypto.createHash("sha256").update(text, "utf8").digest("hex");
 }
 
+function migrateEvidenceRecord(record, transcript, identity) {
+  const legacyKey = `${transcript.mtimeMs}:${transcript.bytes}:${record.memoryHash}`;
+  const key = record.key === legacyKey ? evidenceKey(transcript, record.memoryHash) : record.key;
+  if (record.transcript?.identity === identity && record.key === key) return record;
+  return {
+    ...record,
+    transcript: { ...record.transcript, identity },
+    key,
+  };
+}
+
 /**
  * Cache key for a transcript's analysis: the transcript's own content signature plus
  * the memory-file hash it was judged against. Either changing invalidates the evidence.
  */
 export function evidenceKey(transcript, memoryHash) {
-  return `${transcript.mtimeMs}:${transcript.bytes}:${memoryHash}`;
+  return `${transcriptIdentity(transcript)}:${transcript.mtimeMs}:${transcript.bytes}:${memoryHash}`;
 }
 
 /**

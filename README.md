@@ -143,8 +143,15 @@ Calculating loss costs one call per transcript, so the set is capped first: past
 everything. Each transcript's weight halves every `sampleHalfLife` (default 14d), and the
 sample is drawn without replacement, so recent sessions are almost always kept and old
 ones stay represented in proportion. When this happens the run says so on stderr
-(`discovered 340 transcript(s), analyzing a recency-weighted sample of 100`); pass
-`--max-transcripts all` to analyze every transcript, or `--seed <n>` to reproduce a sample.
+(`discovered 340 transcript(s), analyzing a recency-weighted sample of 100`).
+
+The draw is deterministic and sticky: it is derived from each transcript's own durable
+identity, not from a fresh random seed, so rerunning does not trigger a fresh draw that
+randomly reshuffles the sample and wastes model calls. Existing transcripts keep their
+draws as the corpus grows, while new sessions compete for room on the same footing. Recency
+weights still evolve as transcripts age, so the selected set can change over time. Pass
+`--max-transcripts all` to analyze every transcript, or `--seed <n>` to draw a different,
+equally reproducible sample.
 
 Each distilled trace goes to a cheap model with the memory file and a rubric. It returns
 strict JSON: which instructions helped, which were violated, and what mistakes no current
@@ -415,6 +422,7 @@ CLI flags on top:
   "gapLedgerMaxAge": "90d",
   "maxTranscripts": 100,
   "sampleHalfLife": "14d",
+  "seed": null,
   "analysis": { "agent": null, "model": null, "effort": null },
   "synthesis": { "agent": null, "model": null, "effort": null },
   "ladders": {
@@ -447,7 +455,7 @@ Everything mutable lives in `.backpass/`, kept out of git via the repo's local e
 ```
 .backpass/
   scan-cache.json        collect-samples verdicts by path + mtime + size
-  evidence/<id>.json     per-transcript loss
+  evidence/<identity>.json per-transcript loss
   evidence-summary.json  aggregated gradients
   proposal.json          the latest parseable gradient-descent step (absent if none was produced)
   synthesis/             the staging copy the gradient-descent agent edited (memory file + skills)
