@@ -62,6 +62,9 @@ npx backpass
 ```
 
 Requires **Node >= 22.5** and [`acpx`](https://github.com/openclaw/acpx) on your PATH.
+The default `backpass apply` review UI also requires [`lavish-axi`](https://github.com/kunchenguid/lavish-axi)
+on your PATH; install it with `npm install -g lavish-axi`. To review in the terminal instead, run
+`backpass apply --no-ui`.
 
 backpass has **no API keys of its own**. Every model call goes through acpx to a harness
 you have already authenticated.
