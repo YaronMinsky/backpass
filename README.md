@@ -663,10 +663,11 @@ backpass apply --decisions "e1=accepted e2=rejected:disagree"   # decided elsewh
 `memoryFiles` is an ordered list (default `["AGENTS.md", "CLAUDE.md"]`); the first one
 that exists is the root file a run optimizes, so **AGENTS.md is canonical**. Named
 [nested files](#10-nested-memory-files-in-a-monorepo) are additional weights, not
-separate root files. Resolution is pointer-aware:
+separate root files. A `CLAUDE.md` that imports `AGENTS.md` with `@AGENTS.md`, or is a
+symlink resolving to the same file, is treated as a pointer:
 
-- `CLAUDE.md` containing only `@AGENTS.md` (the standard import) is a pointer: optimizing
-  AGENTS.md covers both harness families and the pointer stays valid. Nothing to report.
+- Optimizing AGENTS.md covers both harness families and the pointer stays valid. Nothing
+  to report.
 - Two separate full files are a divergence hazard. backpass optimizes AGENTS.md, leaves
   CLAUDE.md untouched, and warns each run until you consolidate: move CLAUDE.md's content
   into AGENTS.md and make CLAUDE.md the one-line pointer.
