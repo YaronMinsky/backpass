@@ -586,6 +586,9 @@ every skill's name and trigger line, stamps a gap it judges covered by an existi
 with `coveredBySkill`, and the gap ledger corroborates those citations across sessions
 before synthesis is told to fix the trigger. The same coverage check retires a ledger gap
 once a skill's content answers it, so a gap resolved by extraction stops resurfacing.
+The analysis index lists each skill file once by realpath, keeping its first loaded path
+when symlinks across harness roots share a file. Distinct files remain separate even when
+their names match. This does not change [per-copy budget accounting](#6-the-budget---model-size).
 
 Skills are protected by the same floors as the memory file: text deleted from a skill
 file is a removal, and since no evidence can attribute to skill text, no deletion there
