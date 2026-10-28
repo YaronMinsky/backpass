@@ -533,7 +533,9 @@ for different things:
 
 When a run does fail, the advice it prints comes from the condition it ended on. If the
 rejected proposal included notes, the failure prints those too instead of hiding useful
-diagnostic context. Run `backpass propose` again to start a fresh synthesis.
+diagnostic context. A failed synthesis prompt call reports the assembled prompt's measured
+UTF-8 byte size without printing its contents. That size is diagnostic context, not a
+claim that the prompt was too large. Run `backpass propose` again to start a fresh synthesis.
 
 Token deltas shown to you are measured by backpass from the actual text - never taken from
 the model's own arithmetic.
