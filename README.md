@@ -628,6 +628,12 @@ It cannot be combined with `--no-ui`.
 The flag is repeatable: all supplied vectors are checked together as one vector, each must name at least one edit, and naming an edit twice is refused, even across flags.
 Edits it does not name stay untouched, and every gate below still applies.
 
+After a successful non-dry-run apply with at least one accepted edit, the saved proposal
+records `appliedAt` and `appliedBy: "apply"`. A second apply refuses it before opening
+review or writing anything. Run `backpass` again to produce a fresh proposal, including
+for edits skipped in the completed review. Dry runs and reviews with no accepted edits
+leave the proposal unstamped and available to review again.
+
 The live budget gauge is not just a readout. Apply rechecks the accepted subset against
 the same budget gate as synthesis: stay under the cap, or shrink if the file is already
 over. An incompatible set writes nothing and does not record rejections, so you can pick
@@ -649,8 +655,9 @@ refuses the whole write if any created skill target already exists or two accept
 resolve to the same file.
 
 Skills and non-memory files are written only after every edit has composed, with the memory
-file committed last. A later write failure rolls back files, skills, and loading-layout
-entries created earlier in that round. If another process changes a committed file before
+file committed last. A later write failure, including failure to save the proposal's
+applied stamp, leaves the proposal unstamped and rolls back files, skills, and loading-layout
+entries created earlier in that round so the apply can be retried. If another process changes a committed file before
 rollback reaches it, apply leaves that change untouched and reports the rollback conflict.
 
 For compatibility, proposals created by older backpass versions that do not contain a
