@@ -107,8 +107,8 @@ folder), backpass proceeds but warns that its privacy can't be verified.
 Harness load paths, verified for v1:
 
 - **Claude Code** loads `CLAUDE.md` from `CLAUDE_CONFIG_DIR` (default `~/.claude`)
-  and inlines `@` imports, including `~/` and absolute paths. A CLAUDE.md containing
-  only an import that resolves to the canonical user memory is a valid pointer, such
+  and inlines `@` imports, including `~/` and absolute paths. A CLAUDE.md
+  [import pointer](#9-which-file-is-the-weights) must resolve to the canonical user memory, such
   as `@~/.agents/AGENTS.md` with the default paths.
 - **Codex** loads `AGENTS.md` from `CODEX_HOME` (default `~/.codex`). It follows the
   AGENTS.md convention; `@` import is not assumed.
@@ -192,7 +192,7 @@ whole-surface run (see [Nested memory files](#10-nested-memory-files-in-a-monore
 Nothing else resolves - not a basename, a directory, a path to a SKILL.md, or an
 existing file the config does not name - and an
 unknown name fails, listing the valid ones, instead of falling back to the whole surface. A
-configured file that contains only an `@` import is rejected rather than rewritten or silently
+configured file using the [import pointer form](#9-which-file-is-the-weights) is rejected rather than rewritten or silently
 mapped to its import; the error names the imported memory file, which must itself be configured
 to be targeted. A correctly named skill whose file backpass cannot write - one resolving into a
 location nothing may write, or in project scope one resolving outside the repository - is refused
@@ -669,8 +669,11 @@ backpass apply --decisions "e1=accepted e2=rejected:disagree"   # decided elsewh
 `memoryFiles` is an ordered list (default `["AGENTS.md", "CLAUDE.md"]`); the first one
 that exists is the root file a run optimizes, so **AGENTS.md is canonical**. Named
 [nested files](#10-nested-memory-files-in-a-monorepo) are additional weights, not
-separate root files. A `CLAUDE.md` that imports `AGENTS.md` with `@AGENTS.md`, or is a
-symlink resolving to the same file, is treated as a pointer:
+separate root files. A `CLAUDE.md` is a pointer when it contains exactly one import
+resolving to the primary file, such as `@AGENTS.md` or `@./AGENTS.md`, with optional
+leading ATX headings (`#` through `######`), blank lines and HTML comments. Prose,
+additional imports, and headings after the import make it a separate file. A symlink
+resolving to the primary file is also a pointer:
 
 - Optimizing AGENTS.md covers both harness families and the pointer stays valid. Nothing
   to report.
@@ -749,8 +752,8 @@ weight of its own; a missing file is reported, never created:
   `sampledSessions`, `minGapEvidence`, and `belowMinGapEvidence`. The count is
   report-only and never gates a run.
 
-Each nested directory keeps the pointer model above: name its canonical file, and a
-sibling `AGENTS.md` or `CLAUDE.md` that only imports it needs nothing, while a sibling
+Each nested directory keeps the [pointer model above](#9-which-file-is-the-weights): name its canonical file, and a
+sibling `CLAUDE.md` that points to it needs nothing, while a sibling
 with content of its own is warned about. An entry that is only a pointer is refused. A file listed in both
 `memoryFiles` and `nestedMemoryFiles` is nested. `--target` and `--memory-file` name
 exactly the files a run trains, so neither trains a nested file.
